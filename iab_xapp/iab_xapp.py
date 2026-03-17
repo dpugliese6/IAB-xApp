@@ -1,27 +1,28 @@
-import time
-import signal
-import argparse
-import influxdb_client
-import redis
-import numpy as np
-import pandas as pd
-from influxdb_client.client.write_api import SYNCHRONOUS
+# import time
+# import signal
+# import argparse
+# import influxdb_client
+# import redis
+# import numpy as np
+# import pandas as pd
+# from influxdb_client.client.write_api import SYNCHRONOUS
+import re
+import csv
+from flask import Flask, jsonify, render_template_string
+import json
 
-import setup_imports
+#import setup_imports
 
-# import xDevSM.kpm.xapp_kpm_frame as kpmframe
+# from xDevSM.handlers.xDevSM_rmr_xapp import xDevSMRMRXapp
 
-# import xDevSM base xapp
-from xDevSM.handlers.xDevSM_rmr_xapp import xDevSMRMRXapp
-
-# import xDevSM kpm decorator
-from xDevSM.decorators.kpm.kpm_frame import XappKpmFrame
+# # import xDevSM kpm decorator
+# from xDevSM.decorators.kpm.kpm_frame import XappKpmFrame
 
 
-from xDevSM.sm_framework.py_oran.kpm.enums import format_action_def_e
-from xDevSM.sm_framework.py_oran.kpm.enums import format_ind_msg_e
-from xDevSM.sm_framework.py_oran.kpm.enums import meas_type_enum
-from xDevSM.sm_framework.py_oran.kpm.enums import meas_value_e
+# from xDevSM.sm_framework.py_oran.kpm.enums import format_action_def_e
+# from xDevSM.sm_framework.py_oran.kpm.enums import format_ind_msg_e
+# from xDevSM.sm_framework.py_oran.kpm.enums import meas_type_enum
+# from xDevSM.sm_framework.py_oran.kpm.enums import meas_value_e
 
 logger = None
 
@@ -190,6 +191,335 @@ def sub_failed_callback(json_data):
 
 
 
+def parse_plmn(plmn_str):
+    return {
+        "mcc":        int(re.search(r'mcc\s*=\s*(\d+)', plmn_str).group(1)),
+        "mnc":        int(re.search(r'mnc\s*=\s*(\d+)', plmn_str).group(1)),
+        "mnc_length": int(re.search(r'mnc_length\s*=\s*(\d+)', plmn_str).group(1)),
+    }
+
+
+def parse_value(raw):
+    """Return hex string (e.g. 'e01') or int depending on the value format."""
+    raw = raw.strip()
+    if raw.lower().startswith("0x"):
+        return raw[2:].lower()   # strip '0x', keep as hex string e.g. 'e01'
+    return int(raw)
+
+
+def get_field(key, block):
+    m = re.search(rf'{key}\s*=\s*(0x[0-9a-fA-F]+|\d+)', block)
+    return parse_value(m.group(1)) if m else None
+
+
+def parse_neighbor_cell(block):
+    plmn_m = re.search(r'plmn\s*=\s*\{([^}]+)\}', block)
+    return {
+        "gNB_ID":               get_field("gNB_ID", block),
+        "nr_cellid":            get_field("nr_cellid", block),
+        "physical_cellId":      get_field("physical_cellId", block),
+        "absoluteFrequencySSB": get_field("absoluteFrequencySSB", block),
+        "subcarrierSpacing":    get_field("subcarrierSpacing", block),
+        "band":                 get_field("band", block),
+        "plmn":                 parse_plmn(plmn_m.group(1)) if plmn_m else None,
+        "tracking_area_code":   get_field("tracking_area_code", block),
+    }
+
+
+def split_blocks(text, open_ch="{", close_ch="}"):
+    """Split text into top-level brace-delimited blocks."""
+    blocks, depth, start = [], 0, None
+    for i, ch in enumerate(text):
+        if ch == open_ch:
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0 and start is not None:
+                blocks.append(text[start + 1:i])
+                start = None
+    return blocks
+
+
+def strip_comments(content):
+    """Remove # comments but preserve hex literals like 0xe00."""
+    return re.sub(r'(?<![0-9a-fA-F])#[^\n]*', '', content)
+
+
+def parse_entry(entry_block):
+    ncfg_m = re.search(r'neighbour_cell_configuration\s*=\s*\((.+?)\)\s*;', entry_block, re.DOTALL)
+    neighbors = []
+    if ncfg_m:
+        for nb_block in split_blocks(ncfg_m.group(1)):
+            neighbors.append(parse_neighbor_cell(nb_block))
+
+    # Only parse plmn from the entry block, excluding neighbour_cell_configuration
+    entry_header = entry_block[:entry_block.find("neighbour_cell_configuration")] if "neighbour_cell_configuration" in entry_block else entry_block
+    plmn_m = re.search(r'plmn\s*=\s*\{([^}]+)\}', entry_header)
+
+    return {
+        "gNB_ID":          get_field("gNB_ID", entry_header),
+        "nr_cellid":       get_field("nr_cellid", entry_header),
+        "physical_cellId": get_field("physical_cellId", entry_header),
+        "plmn":            parse_plmn(plmn_m.group(1)) if plmn_m else None,
+        "neighbours":      neighbors,
+    }
+
+
+def parse_neighbor_list(filepath):
+    with open(filepath, "r") as f:
+        content = f.read()
+
+    content = strip_comments(content)
+
+    nl_m = re.search(r'neighbour_list\s*=\s*\((.+)\)\s*;', content, re.DOTALL)
+    if not nl_m:
+        print("DEBUG: Could not find neighbour_list block. Stripped content preview:")
+        print(repr(content[:300]))
+        raise ValueError("neighbour_list block not found in file")
+
+    entries = []
+    for entry_block in split_blocks(nl_m.group(1)):
+        entries.append(parse_entry(entry_block))
+
+    return entries
+
+def get_gnb_list(neighbor_list):
+    result = []
+    for entry in neighbor_list:
+        plmn = entry["plmn"]
+        mcc_str = str(plmn["mcc"]).zfill(3)
+        mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
+        gnb_id_str = entry["gNB_ID"].zfill(8)
+
+        result.append(f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str}")
+    return result
+
+def get_gnb_neighbors(neighbor_list, gnb_list):
+    result = []
+    for entry in neighbor_list:
+        neighbors = []
+        for nb in entry["neighbours"]:
+            plmn = nb["plmn"]
+            mcc_str = str(plmn["mcc"]).zfill(3)
+            mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
+            gnb_id_str = nb["gNB_ID"].zfill(8)
+            neighbors.append(f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str}")
+        result.append(neighbors)
+    return result
+
+
+def get_gnb_list(neighbor_list):
+    result = []
+    for entry in neighbor_list:
+        plmn = entry["plmn"]
+        mcc_str = str(plmn["mcc"]).zfill(3)
+        mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
+        gnb_id_str = entry["gNB_ID"].zfill(8)
+        result.append(f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str}")
+    return result
+
+
+def get_gnb_neighbors(neighbor_list, gnb_list):
+    result = []
+    for entry in neighbor_list:
+        neighbors = []
+        for nb in entry["neighbours"]:
+            plmn = nb["plmn"]
+            mcc_str = str(plmn["mcc"]).zfill(3)
+            mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
+            gnb_id_str = nb["gNB_ID"].zfill(8)
+            neighbors.append(f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str}")
+        result.append(neighbors)
+    return result
+
+    
+def parse_topology_csv(filepath, gnb_list, gnb_neighbors):
+    import csv
+    topology = {gnb: {} for gnb in gnb_list}
+
+    with open(filepath, newline="") as f:
+        for row in csv.reader(f, delimiter=";"):
+            if not row:
+                continue
+            gnb_id       = row[0].strip()
+            ue_id        = row[1].strip()
+            serving_rsrp = float(row[2])
+
+            neighbor_rsrp = {}
+            i = 3
+            while i + 1 < len(row):
+                nb_index = int(row[i])
+                nb_rsrp  = float(row[i + 1])
+                i += 2
+                if gnb_id in gnb_list:
+                    gnb_idx = gnb_list.index(gnb_id)
+                    nb_list = gnb_neighbors[gnb_idx]
+                    if nb_index < len(nb_list):
+                        neighbor_rsrp[nb_list[nb_index]] = nb_rsrp
+
+            if gnb_id in topology:
+                topology[gnb_id][ue_id] = {
+                    "serving_rsrp":  serving_rsrp,
+                    "neighbor_rsrp": neighbor_rsrp,
+                }
+
+    return topology
+
+    
+def build_graph(gnb_list, gnb_neighbors, topology):
+    nodes, edges = [], []
+    seen_edges = set()
+
+    for gnb in gnb_list:
+        nodes.append({"id": gnb, "type": "gnb", "label": gnb})
+
+    for gnb_id, ues in topology.items():
+        for ue_id, data in ues.items():
+            nodes.append({"id": ue_id, "type": "ue", "label": ue_id})
+            edges.append({
+                "from":  ue_id,
+                "to":    gnb_id,
+                "style": "solid",
+                "rsrp":  data["serving_rsrp"],
+            })
+            for nb_gnb, nb_rsrp in data["neighbor_rsrp"].items():
+                key = (ue_id, nb_gnb)
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    edges.append({
+                        "from":  ue_id,
+                        "to":    nb_gnb,
+                        "style": "dashdot",
+                        "rsrp":  nb_rsrp,
+                    })
+
+    return {"nodes": nodes, "edges": edges}
+
+
+# ── HTML template ─────────────────────────────────────────────────────────────
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Network Topology</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  body { margin: 0; background: #1a1a2e; color: #eee; font-family: sans-serif; }
+  h2   { text-align: center; padding: 12px; margin: 0; color: #a0c4ff; }
+  #net { width: 100vw; height: calc(100vh - 50px); }
+  #legend {
+    position: absolute; top: 60px; left: 16px;
+    background: rgba(0,0,0,0.6); border-radius: 8px; padding: 10px 16px;
+    font-size: 13px;
+  }
+  .leg-item { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .leg-line { width: 36px; height: 3px; }
+  .solid   { background: #74c0fc; }
+  .dashdot { background: repeating-linear-gradient(90deg,#f08c00 0,#f08c00 6px,transparent 6px,transparent 10px); }
+  #status {
+    position: absolute; top: 60px; right: 16px;
+    background: rgba(0,0,0,0.6); border-radius: 8px; padding: 6px 12px;
+    font-size: 12px; color: #a9e34b;
+  }
+</style>
+</head>
+<body>
+<h2>Network Topology</h2>
+<div id="legend">
+  <div class="leg-item"><div class="leg-line solid"></div> Serving (solid)</div>
+  <div class="leg-item"><div class="leg-line dashdot"></div> Neighbour measurement (dash-dot)</div>
+</div>
+<div id="status">Waiting for data...</div>
+<div id="net"></div>
+<script>
+function toVisNode(n) {
+  return {
+    id: n.id, label: n.label,
+    shape: n.type === "gnb" ? "diamond" : "dot",
+    size:  n.type === "gnb" ? 28 : 14,
+    color: n.type === "gnb"
+      ? { background: "#4dabf7", border: "#1971c2" }
+      : { background: "#a9e34b", border: "#5c940d" },
+    font: { color: "#fff", size: 11 },
+  };
+}
+
+function toVisEdge(e, i) {
+  return {
+    id: i, from: e.from, to: e.to,
+    label:  e.rsrp.toFixed(1) + " dBm",
+    color:  { color: e.style === "solid" ? "#74c0fc" : "#f08c00" },
+    dashes: e.style === "dashdot" ? [6, 4, 2, 4] : false,
+    width:  e.style === "solid" ? 2.5 : 1.5,
+    font:   { size: 9, color: "#ccc", align: "middle" },
+    smooth: { type: "curvedCW", roundness: 0.2 },
+  };
+}
+
+const nodes   = new vis.DataSet([]);
+const edges   = new vis.DataSet([]);
+const network = new vis.Network(
+  document.getElementById("net"),
+  { nodes, edges },
+  {
+    physics: {
+      solver: "forceAtlas2Based",
+      forceAtlas2Based: { gravitationalConstant: -60, springLength: 160 },
+      stabilization: { iterations: 300 },
+    },
+    interaction: { hover: true, tooltipDelay: 100 },
+  }
+);
+
+const status = document.getElementById("status");
+
+async function refresh() {
+  try {
+    const res   = await fetch("/graph?" + Date.now());
+    const graph = await res.json();
+
+    const newNodeIds = new Set(graph.nodes.map(n => n.id));
+    const newEdgeIds = new Set(graph.edges.map((_, i) => i));
+
+    nodes.remove(nodes.getIds().filter(id => !newNodeIds.has(id)));
+    edges.remove(edges.getIds().filter(id => !newEdgeIds.has(id)));
+    nodes.update(graph.nodes.map(toVisNode));
+    edges.update(graph.edges.map(toVisEdge));
+
+    status.textContent = "Last update: " + new Date().toLocaleTimeString();
+    status.style.color = "#a9e34b";
+  } catch (err) {
+    status.textContent = "Update failed: " + err.message;
+    status.style.color = "#ff6b6b";
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>"""
+
+
+
+def create_app(neighbor_list):
+    app = Flask(__name__)
+    gnb_list      = get_gnb_list(neighbor_list)
+    gnb_neighbors = get_gnb_neighbors(neighbor_list, gnb_list)
+
+    @app.route("/")
+    def index():
+        return render_template_string(HTML)
+
+    @app.route("/graph")
+    def graph():
+        topology = parse_topology_csv("network_topology.csv", gnb_list, gnb_neighbors)
+        return jsonify(build_graph(gnb_list, gnb_neighbors, topology))
+
+    return app
 
 def main(args):
     global logger
@@ -275,45 +605,53 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="kpm xApp")
+    # parser = argparse.ArgumentParser(description="kpm xApp")
     
-    parser.add_argument("-s", "--sst", metavar="<sst>",
-                        help="SST", type=int, default=1)
+    # parser.add_argument("-s", "--sst", metavar="<sst>",
+    #                     help="SST", type=int, default=1)
     
-    parser.add_argument("-d", "--sd", metavar="<sd>",
-                        help="SD", type=int, default=1)
+    # parser.add_argument("-d", "--sd", metavar="<sd>",
+    #                     help="SD", type=int, default=1)
     
-    parser.add_argument("-i", "--influx_end_point", metavar="http://<ip>:port",
-                        help="influx db endpoint", type=str, default=None)
+    # parser.add_argument("-i", "--influx_end_point", metavar="http://<ip>:port",
+    #                     help="influx db endpoint", type=str, default=None)
     
-    parser.add_argument("-o", "--organization", metavar="<organization>",
-                        help="influx db organization", type=str, default="docs")
+    # parser.add_argument("-o", "--organization", metavar="<organization>",
+    #                     help="influx db organization", type=str, default="docs")
     
-    parser.add_argument("-t", "--token", metavar="<token>",
-                        help="influx db token", type=str, default="mytoken0==")
+    # parser.add_argument("-t", "--token", metavar="<token>",
+    #                     help="influx db token", type=str, default="mytoken0==")
     
-    parser.add_argument("-b", "--bucket", metavar="<bucket>",
-                        help="influx db bucket", type=str, default="xapp_bucket")
+    # parser.add_argument("-b", "--bucket", metavar="<bucket>",
+    #                     help="influx db bucket", type=str, default="xapp_bucket")
 
-    parser.add_argument("--redis_end_point", metavar="<host:port>",
-                        help="Redis endpoint", type=str, default=None)
+    # parser.add_argument("--redis_end_point", metavar="<host:port>",
+    #                     help="Redis endpoint", type=str, default=None)
     
-    parser.add_argument("--redis_pwd", metavar="<redis_pwd>",
-                        help="Redis password", type=str, default=None)
+    # parser.add_argument("--redis_pwd", metavar="<redis_pwd>",
+    #                     help="Redis password", type=str, default=None)
 
-    parser.add_argument("-r", "--route_file", metavar="<route_file>",
-                        help="path of xApp route file",
-                        type=str, default="./config/uta_rtg.rt")
+    # parser.add_argument("-r", "--route_file", metavar="<route_file>",
+    #                     help="path of xApp route file",
+    #                     type=str, default="./config/uta_rtg.rt")
     
-    parser.add_argument("-c", "--csv_file", metavar="<csv_file>",
-                        help="path of csv file",
-                        type=str)
+    # parser.add_argument("-c", "--csv_file", metavar="<csv_file>",
+    #                     help="path of csv file",
+    #                     type=str)
 
-    parser.add_argument("-g", "--gnb_target", metavar="<gnb_target>",
-                        help="gNB to subscribe to",
-                        type=str)
+    # parser.add_argument("-g", "--gnb_target", metavar="<gnb_target>",
+    #                     help="gNB to subscribe to",
+    #                     type=str)
     
-    args = parser.parse_args()
+    # args = parser.parse_args()
     
-    main(args)
+    neighbor_list = parse_neighbor_list("neighborhood.conf")
+    #print(json.dumps(neighbor_list, indent=2))
+    gnb_list= get_gnb_list(neighbor_list)
+    print(json.dumps(gnb_list, indent=2))
+    gnb_neighbors = get_gnb_neighbors(neighbor_list, gnb_list)
+    print(json.dumps(gnb_neighbors, indent=2))
+    app = create_app(neighbor_list)
+    app.run(host="0.0.0.0", port=8080, debug=False)
+    # main(args)
 
