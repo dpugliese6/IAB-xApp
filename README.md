@@ -2,6 +2,10 @@
 
 This repository contains a set of example xApps built using the xDevSM framework.
 
+### **IMPORTANT**: In order to use this xApp, the following line in *xDevSM/decorators/kpm/kpm_frame.py* must be uncommented
+```
+# self.subscriber.Unsubscribe(self.subscription_id[key])
+```
 ## Use xDevSM
 
 Clone the repository and initialize the submodules:
