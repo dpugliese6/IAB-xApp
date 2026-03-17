@@ -2,7 +2,7 @@
 
 This repository contains a set of example xApps built using the xDevSM framework.
 
-### **IMPORTANT**: In order to use this xApp, the following line in *xDevSM/decorators/kpm/kpm_frame.py* must be uncommented
+### **IMPORTANT**: In order to use the IAB xApp, the following line in *xDevSM/decorators/kpm/kpm_frame.py* must be uncommented
 ```
 # self.subscriber.Unsubscribe(self.subscription_id[key])
 ```
@@ -10,7 +10,7 @@ This repository contains a set of example xApps built using the xDevSM framework
 
 Clone the repository and initialize the submodules:
 ```bash
-git clone https://github.com/wineslab/xDevSM-xapps-examples.git
+git clone https://github.com/dpugliese6/IAB-xApp.git
 
 # clone xDevSM code
 git submodule init
@@ -27,7 +27,7 @@ git submodule update
 ```bash
 docker build --tag <xapp-name>:<version> --file docker/Dockerfile.<xapp_folder> .
 ```
-4. Tag and push the built image to your registry.
+4. Tag and push the built image to your registry (log in docker hub with `sudo docker login` before).
 
 ```bash
 docker tag <xapp-name>:<version> <your_registry>/<xapp-name>:<version>
