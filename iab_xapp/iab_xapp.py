@@ -1,189 +1,163 @@
-# import time
-# import signal
-# import argparse
-# import influxdb_client
-# import redis
-# import numpy as np
-# import pandas as pd
-# from influxdb_client.client.write_api import SYNCHRONOUS
+import time
+import signal
+import argparse
+import influxdb_client
+import redis
+import numpy as np
+import pandas as pd
+from influxdb_client.client.write_api import SYNCHRONOUS
 import re
 import csv
+import threading
 from flask import Flask, jsonify, render_template_string
 import json
+import sys
 
-#import setup_imports
+import setup_imports
 
-# from xDevSM.handlers.xDevSM_rmr_xapp import xDevSMRMRXapp
+from xDevSM.handlers.xDevSM_rmr_xapp import xDevSMRMRXapp
 
-# # import xDevSM kpm decorator
-# from xDevSM.decorators.kpm.kpm_frame import XappKpmFrame
-
-
-# from xDevSM.sm_framework.py_oran.kpm.enums import format_action_def_e
-# from xDevSM.sm_framework.py_oran.kpm.enums import format_ind_msg_e
-# from xDevSM.sm_framework.py_oran.kpm.enums import meas_type_enum
-# from xDevSM.sm_framework.py_oran.kpm.enums import meas_value_e
-
-logger = None
-
-class DataManager():
-    """
-    This class manages data storage in InfluxDB, Redis, and CSV.
-    """
-    def __init__(self, kpm_xapp, organization, token, bucket, influxdb_end_point=None, redis_end_point=None, redis_pwd=None, csv_file=None):
-        self.kpm_xapp = kpm_xapp
-        self.organization = organization
-        self.client_influx = None
-        self.write_api = None
-        self.client_redis = None
-        self.bucket = bucket
-        self.org = organization
-        self.df = None
-        self.df_dict = {}
-        self.csv_file = csv_file
-        
-        if influxdb_end_point:
-            self.client_influx = influxdb_client.InfluxDBClient(
-                    url=influxdb_end_point,
-                    token=token,
-                    org=organization
-            )
-            self.write_api = self.client_influx.write_api(write_options=SYNCHRONOUS)
-        
-        if redis_end_point:
-            try:
-                host, port = redis_end_point.split(':')
-                self.client_redis = redis.Redis(host=host, 
-                                                port=int(port), 
-                                                password=redis_pwd,
-                                                decode_responses=False)
-                self.client_redis.ping()
-                logger.info("[DataManager] connected to redis!")
-            except Exception as e:
-                logger.warning(f"Failed to connect to Redis at {redis_end_point}: {e}")
-                self.client_redis = None
-        
-        if csv_file:
-            self.df_dict = {}
-            self.df_dict ["timestamp"]= []
-            self.df_dict["ue_id"] = []
-            self.df_dict["gnb_id"] = []
-
-    def store_on_influx(self, gnb_id, ue_id, meas_type, meas_record):
-        ue_id = "ue_" + str(ue_id)
-        p = influxdb_client.Point("xapp-stats").tag("gnb_id", gnb_id).tag("ue_id", ue_id)
-        
-        meas_type_bs = bytes(np.ctypeslib.as_array(meas_type.buf, shape = (meas_type.len,)))
-        meas_type_str = meas_type_bs.decode('utf-8')
-        if meas_record.value.value == meas_value_e.INTEGER_MEAS_VALUE:
-            p.field(meas_type_str, meas_record.union.int_val)
-            logger.info("{}:{}".format(meas_type_str, meas_record.union.int_val))
-        elif meas_record.value.value == meas_value_e.REAL_MEAS_VALUE:
-            p.field(meas_type_str, meas_record.union.real_val)
-            logger.info("{}:{}".format(meas_type_str, meas_record.union.real_val))
-        
-        # storing on influxdb
-        self.write_api.write(bucket=self.bucket, org=self.org, record=p)
-
-    def store_on_redis(self, gnb_id, ue_id, meas_type, meas_record):
-        """Store measurement in Redis hash"""
-        try:
-            ue_id_str = "ue_" + str(ue_id)
-            key = f"xapp:metrics:{gnb_id}:{ue_id_str}"
-            
-            meas_type_bs = bytes(np.ctypeslib.as_array(meas_type.buf, shape=(meas_type.len,)))
-            meas_type_str = meas_type_bs.decode('utf-8')
-            
-            if meas_record.value.value == meas_value_e.INTEGER_MEAS_VALUE:
-                value = str(meas_record.union.int_val)
-            elif meas_record.value.value == meas_value_e.REAL_MEAS_VALUE:
-                value = str(meas_record.union.real_val)
-            else:
-                return
-            
-            self.client_redis.hset(key, meas_type_str, value)
-            self.client_redis.expire(key, 300)  # 5 min expiry
-        except Exception as e:
-            logger.warning(f"Failed to store on Redis: {e}")
-
-    def store_to_csv(self,gnb_id, ue_id, meas_type, meas_record):
-        ue_id = "ue_" + str(ue_id)
-        # self.df_dict["ue_id"].append(ue_id)
-        # self.df_dict["gnb_id"].append(gnb_id)
-
-        meas_type_bs = bytes(np.ctypeslib.as_array(meas_type.buf, shape = (meas_type.len,)))
-        meas_type_str = meas_type_bs.decode('utf-8')
-        if meas_type_str not in self.df_dict.keys():
-            self.df_dict[meas_type_str] = []
-        if meas_record.value.value == meas_value_e.INTEGER_MEAS_VALUE:
-            logger.info("{}:{}".format(meas_type_str, meas_record.union.int_val))
-            self.df_dict[meas_type_str].append(meas_record.union.int_val)
-        elif meas_record.value.value == meas_value_e.REAL_MEAS_VALUE:
-            logger.info("{}:{}".format(meas_type_str, meas_record.union.real_val))
-            self.df_dict[meas_type_str].append(meas_record.union.real_val)
+# import xDevSM kpm decorator
+from xDevSM.decorators.kpm.kpm_frame import XappKpmFrame
 
 
-    # Called for each indication message received
-    def indication_callback(self, ind_hdr, ind_msg, meid):
-        gnbid = meid.decode('utf-8')
-        logger.info("[Main] Received indication message from {}".format(gnbid))        
-        # Decoding sender_name
-        sender_name = None
-        if ind_hdr.data.kpm_ric_ind_hdr_format_1.sender_name:
-            my_string = bytes(np.ctypeslib.as_array(ind_hdr.data.kpm_ric_ind_hdr_format_1.sender_name.contents.buf, shape = (ind_hdr.data.kpm_ric_ind_hdr_format_1.sender_name.contents.len,)))
-            sender_name = my_string.decode('utf-8') 
-        
-        if sender_name is None:
-            logger.info("[Main]Sender name not specified in the indication message")
+from xDevSM.sm_framework.py_oran.kpm.enums import format_action_def_e
+from xDevSM.sm_framework.py_oran.kpm.enums import format_ind_msg_e
+from xDevSM.sm_framework.py_oran.kpm.enums import meas_type_enum
+from xDevSM.sm_framework.py_oran.kpm.enums import meas_value_e
 
-        
-        if ind_msg.type.value == format_ind_msg_e.FORMAT_3_INDICATION_MESSAGE:
-            for i in range(ind_msg.data.frm_3.ue_meas_report_lst_len):
-                # for each ue
-                meas_report_ue = ind_msg.data.frm_3.meas_report_per_ue[i]
-                # ue id
-                ue_id = self.kpm_xapp.get_ue_id(meas_report_ue.ue_meas_report_lst)
-                if self.csv_file is not None:
-                    ue_id_str = "ue_" + str(ue_id)
-                    self.df_dict["timestamp"].append(int(time.time() * 1000))
-                    self.df_dict["ue_id"].append(ue_id_str)
-                    self.df_dict["gnb_id"].append(gnbid)
-                logger.info("[Main]gnb: {}, sender_name: {}, ue: {}".format(gnbid, sender_name, ue_id))
-                ind_msg_format_1 = meas_report_ue.ind_msg_format_1
-                for j in range(ind_msg_format_1.meas_data_lst_len):
-                    meas_data_lst = ind_msg_format_1.meas_data_lst
-                    for k in range(meas_data_lst[j].meas_record_len):
-                        meas_record_lst_el = meas_data_lst[j].meas_record_lst[k]
-                        if ind_msg_format_1.meas_info_lst[k].meas_type.type.value == meas_type_enum.NAME_MEAS_TYPE:
-                            if not self.client_influx is None:
-                                self.store_on_influx(gnb_id=gnbid, ue_id=ue_id, meas_type=ind_msg_format_1.meas_info_lst[k].meas_type.value.name,
-                                                    meas_record=meas_record_lst_el)
-                            if not self.client_redis is None:
-                                self.store_on_redis(gnb_id=gnbid, ue_id=ue_id, meas_type=ind_msg_format_1.meas_info_lst[k].meas_type.value.name,
-                                                   meas_record=meas_record_lst_el)
-                            if not self.csv_file is None:
-                                self.store_to_csv(gnb_id=gnbid, ue_id=ue_id, meas_type=ind_msg_format_1.meas_info_lst[k].meas_type.value.name,
-                                                meas_record=meas_record_lst_el)
-                        else:
-                            logger.info("[Main] Not supported meas type {}".format(ind_msg_format_1.meas_info_lst[k].meas_type.type.value))
-        else:
-            logger.info("[Main] format not supported for storing")
-        
-        if self.client_influx is None and self.client_redis is None and self.csv_file is None:
-            logger.info("[Main]indication message not stored")
-            ind_msg.print_meas_info(logger)
-    
-    def shutdown(self):
-        logger.info("[Main] Shutting down DataManager")
-        if not self.client_influx is None:
-            logger.info("[Main] closing influx connection")
-            self.client_influx.close()
-        if self.df_dict is not None:
-            self.df = pd.DataFrame.from_dict(self.df_dict, orient='index').transpose()
-            self.df.to_csv(self.csv_file, index=False)
-        if not self.client_redis is None:
-            logger.info("[Main] closing redis connection")
-            self.client_redis.close()
+global logger
+
+STALE_TIMEOUT_MS = 5000
+
+# topology_data[i] = list of measurement dicts for gnb_list[i]
+# each dict: {timestamp, sst, sd, ue_id, value_serv, value_neigh_0, ...}
+topology_data        = []
+gnb_list_global      = []
+gnb_neighbors_global = []
+gnb_count_global     = 0
+csv_file_global      = None
+kpm_xapp_global      = None
+
+
+def _upsert_record(gnb_idx, ue_id, sst, sd, record):
+    for i, r in enumerate(topology_data[gnb_idx]):
+        if r["ue_id"] == ue_id and r["sst"] == sst and r["sd"] == sd:
+            topology_data[gnb_idx][i] = record
+            return
+    topology_data[gnb_idx].append(record)
+
+
+def _cleanup_stale(gnb_idx):
+    now_ms = int(time.time() * 1000)
+    topology_data[gnb_idx] = [
+        r for r in topology_data[gnb_idx]
+        if now_ms - r["timestamp"] <= STALE_TIMEOUT_MS
+    ]
+
+
+def write_csv():
+    if csv_file_global is None:
+        return
+    fieldnames = ["timestamp", "gnb_id", "sst", "sd", "ue_id", "value_serv"] + \
+                 [f"value_neigh_{i}" for i in range(gnb_count_global)]
+    with open(csv_file_global, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for gnb_idx, records in enumerate(topology_data):
+            for r in records:
+                writer.writerow({"gnb_id": gnb_list_global[gnb_idx], **r})
+
+
+def indication_callback(ind_hdr, ind_msg, meid):
+    gnbid = meid.decode('utf-8')
+    logger.info("[Main] Received indication message from {}".format(gnbid))
+    # Decoding sender_name
+    sender_name = None
+    if ind_hdr.data.kpm_ric_ind_hdr_format_1.sender_name:
+        my_string = bytes(np.ctypeslib.as_array(ind_hdr.data.kpm_ric_ind_hdr_format_1.sender_name.contents.buf, shape = (ind_hdr.data.kpm_ric_ind_hdr_format_1.sender_name.contents.len,)))
+        sender_name = my_string.decode('utf-8')
+
+    if sender_name is None:
+        logger.info("[Main] Sender name not specified in the indication message")
+
+    try:
+        gnb_idx = gnb_list_global.index(gnbid)
+    except ValueError:
+        logger.warning("[Main] gNB {} not in gnb_list, skipping".format(gnbid))
+        return
+
+    if ind_msg.type.value == format_ind_msg_e.FORMAT_3_INDICATION_MESSAGE:
+        for i in range(ind_msg.data.frm_3.ue_meas_report_lst_len):
+            # for each ue
+            meas_report_ue = ind_msg.data.frm_3.meas_report_per_ue[i]
+
+            ue_id = kpm_xapp_global.get_ue_id(meas_report_ue.ue_meas_report_lst)
+
+            logger.info("[Main] gnb: {}, sender_name: {}, ue: {}".format(gnbid, sender_name, ue_id))
+            ind_msg_format_1 = meas_report_ue.ind_msg_format_1
+            #for j in range(ind_msg_format_1.meas_data_lst_len): #Per each measurement data
+            j = (ind_msg_format_1.meas_data_lst_len - 1) # The last one
+            meas_data_lst = ind_msg_format_1.meas_data_lst
+            serv_vals = []
+            neigh_vals = {}  # { n: [values...] }
+            neigh_pattern = re.compile(r'L1M\.SS-RSRPNrNbr\.(\d+)\.\d+')
+            serv_pattern  = re.compile(r'L1M\.SS-RSRP\.\d+')
+
+            for k in range(meas_data_lst[j].meas_record_len):
+                meas_record_lst_el = meas_data_lst[j].meas_record_lst[k]
+                if ind_msg_format_1.meas_info_lst[k].meas_type.type.value == meas_type_enum.NAME_MEAS_TYPE:
+                    meas_type     = ind_msg_format_1.meas_info_lst[k].meas_type.value.name
+                    meas_record   = meas_record_lst_el
+
+                    meas_type_bs  = bytes(np.ctypeslib.as_array(meas_type.buf, shape=(meas_type.len,)))
+                    meas_type_str = meas_type_bs.decode('utf-8')
+
+                    if meas_record.value.value == meas_value_e.INTEGER_MEAS_VALUE:
+                        val = meas_record.union.int_val
+                    elif meas_record.value.value == meas_value_e.REAL_MEAS_VALUE:
+                        val = meas_record.union.real_val
+                    else:
+                        continue
+
+                    logger.info("{}:{}".format(meas_type_str, val))
+
+                    if serv_pattern.fullmatch(meas_type_str):
+                        serv_vals.append(val)
+
+                    elif m := neigh_pattern.fullmatch(meas_type_str):
+                        n = int(m.group(1))
+                        neigh_vals.setdefault(n, []).append(val)
+                else:
+                    logger.info("[Main] Not supported meas type {}".format(ind_msg_format_1.meas_info_lst[k].meas_type.type.value))
+            # After the loop
+            serv_RSRP = np.mean([v for v in serv_vals if v != 0]) if any(v != 0 for v in serv_vals) else 0
+            neigh_RSRP = np.full(gnb_count_global, 0)
+            for n, vals in neigh_vals.items():
+                non_zero = [v for v in vals if v != 0]
+                if non_zero:
+                    neigh_RSRP[n] = np.mean(non_zero)
+
+            record = {
+                "timestamp":  int(time.time() * 1000),
+                "sst":        1,
+                "sd":         1,
+                "ue_id":      str(ue_id),
+                "value_serv": serv_RSRP,
+                **{f"value_neigh_{i}": neigh_RSRP[i] for i in range(gnb_count_global)},
+            }
+            _upsert_record(gnb_idx, str(ue_id), 1, 1, record)
+            _cleanup_stale(gnb_idx)
+
+        write_csv()
+
+    else:
+        logger.info("[Main] format not supported for storing")
+
+
+def shutdown():
+    logger.info("[Main] Shutting down")
+    write_csv()
 
 
 def sub_failed_callback(json_data):
@@ -335,36 +309,21 @@ def get_gnb_neighbors(neighbor_list, gnb_list):
     return result
 
     
-def parse_topology_csv(filepath, gnb_list, gnb_neighbors):
-    import csv
-    topology = {gnb: {} for gnb in gnb_list}
-
-    with open(filepath, newline="") as f:
-        for row in csv.reader(f, delimiter=";"):
-            if not row:
-                continue
-            gnb_id       = row[0].strip()
-            ue_id        = row[1].strip()
-            serving_rsrp = float(row[2])
-
-            neighbor_rsrp = {}
-            i = 3
-            while i + 1 < len(row):
-                nb_index = int(row[i])
-                nb_rsrp  = float(row[i + 1])
-                i += 2
-                if gnb_id in gnb_list:
-                    gnb_idx = gnb_list.index(gnb_id)
-                    nb_list = gnb_neighbors[gnb_idx]
-                    if nb_index < len(nb_list):
-                        neighbor_rsrp[nb_list[nb_index]] = nb_rsrp
-
-            if gnb_id in topology:
-                topology[gnb_id][ue_id] = {
-                    "serving_rsrp":  serving_rsrp,
-                    "neighbor_rsrp": neighbor_rsrp,
-                }
-
+def topology_from_memory():
+    topology = {gnb: {} for gnb in gnb_list_global}
+    for gnb_idx, records in enumerate(topology_data):
+        gnb_id  = gnb_list_global[gnb_idx]
+        nb_list = gnb_neighbors_global[gnb_idx]
+        for r in records:
+            neighbor_rsrp = {
+                nb_gnb: r[f"value_neigh_{i}"]
+                for i, nb_gnb in enumerate(nb_list)
+                if r.get(f"value_neigh_{i}", 0) != 0
+            }
+            topology[gnb_id][r["ue_id"]] = {
+                "serving_rsrp":  r["value_serv"],
+                "neighbor_rsrp": neighbor_rsrp,
+            }
     return topology
 
     
@@ -505,10 +464,8 @@ setInterval(refresh, 5000);
 
 
 
-def create_app(neighbor_list):
+def create_app():
     app = Flask(__name__)
-    gnb_list      = get_gnb_list(neighbor_list)
-    gnb_neighbors = get_gnb_neighbors(neighbor_list, gnb_list)
 
     @app.route("/")
     def index():
@@ -516,13 +473,39 @@ def create_app(neighbor_list):
 
     @app.route("/graph")
     def graph():
-        topology = parse_topology_csv("network_topology.csv", gnb_list, gnb_neighbors)
-        return jsonify(build_graph(gnb_list, gnb_neighbors, topology))
+        topology = topology_from_memory()
+        return jsonify(build_graph(gnb_list_global, gnb_neighbors_global, topology))
 
     return app
 
-def main(args):
-    global logger
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="kpm xApp")
+    
+    parser.add_argument("-s", "--sst", metavar="<sst>",
+                        help="SST", type=int, default=1)
+    
+    parser.add_argument("-d", "--sd", metavar="<sd>",
+                        help="SD", type=int, default=1)
+
+
+    parser.add_argument("-r", "--route_file", metavar="<route_file>",
+                        help="path of xApp route file",
+                        type=str, default="./config/uta_rtg.rt")
+
+
+    parser.add_argument("-g", "--gnb_target", metavar="<gnb_target>",
+                        help="gNB to subscribe to",
+                        type=str)
+    
+    args = parser.parse_args()
+    
+    neighbor_list = parse_neighbor_list("neighborhood.conf")
+    #print(json.dumps(neighbor_list, indent=2))
+    gnb_list= get_gnb_list(neighbor_list)
+    print(json.dumps(gnb_list, indent=2))
+    gnb_neighbors = get_gnb_neighbors(neighbor_list, gnb_list)
+    print(json.dumps(gnb_neighbors, indent=2))
+    #global logger
         
     # Creating a generic xDevSM RMR xApp
     xapp_gen = xDevSMRMRXapp("0.0.0.0", route_file=args.route_file)
@@ -538,18 +521,30 @@ def main(args):
                             xapp_gen.http_port,xapp_gen.get_pltnamespace(), 
                             xapp_gen.get_app_namespace())
     
-    # Creating a DataManager instance
-    data_manager = DataManager(kpm_xapp=kpm_xapp, organization=args.organization, token=args.token, bucket=args.bucket,
-                               influxdb_end_point=args.influx_end_point, redis_end_point=args.redis_end_point, redis_pwd=args.redis_pwd, csv_file=args.csv_file)
-    
-    # Registering the DataManager shutdown function to clean data resources
-    xapp_gen.register_shutdown(data_manager.shutdown)
+    # Initialise global topology state
+    gnb_list_global      = gnb_list
+    gnb_neighbors_global = gnb_neighbors
+    gnb_count_global     = len(gnb_list) - 1
+    csv_file_global      = "network_topology.csv"
+    kpm_xapp_global      = kpm_xapp
+    topology_data        = [[] for _ in gnb_list]
+
+    # Start Flask web server in background thread
+    flask_app = create_app()
+    flask_thread = threading.Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=8080, debug=False),
+        daemon=True,
+    )
+    flask_thread.start()
+
+    # Registering the shutdown function
+    xapp_gen.register_shutdown(shutdown)
 
     # Registering the outermost rmr handler
-    xapp_gen.register_handler(kpm_xapp.handle) 
+    xapp_gen.register_handler(kpm_xapp.handle)
 
     # Registering indication message callback
-    kpm_xapp.register_ind_msg_callback(handler=data_manager.indication_callback)
+    kpm_xapp.register_ind_msg_callback(handler=indication_callback)
     # Registering subscription failed callback
     kpm_xapp.register_sub_fail_callback(handler=sub_failed_callback)
 
@@ -561,7 +556,7 @@ def main(args):
     if not gnb:
         logger.info("[Main] Terminating xapp")
         kpm_xapp.terminate(signal.SIGTERM, None)
-        return
+        sys.exit(1)
     
     # There exist one gnb available
     ran_function_description = kpm_xapp.get_ran_function_description(json_ran_info=gnb_info)
@@ -582,7 +577,7 @@ def main(args):
     if selected_format == format_action_def_e.END_ACTION_DEFINITION:
         logger.error("[Main] No supported action definition format")
         kpm_xapp.terminate(signal.SIGTERM, None)
-        return
+        sys.exit(1)
 
     # Selecting only supported action definition
     func_def_sub_dict[selected_format] = func_def_dict[selected_format]
@@ -595,63 +590,11 @@ def main(args):
 
     if status != 201:
         logger.error("[Main] something during subscription went wrong - status: {}".format(status))
-        return
+        sys.exit(1)
 
     # Start running after finishing subscription requests
 
     logger.info("[Main] Starting xapp")
     xapp_gen.run()
 
-
-
-if __name__ == '__main__':
-    # parser = argparse.ArgumentParser(description="kpm xApp")
-    
-    # parser.add_argument("-s", "--sst", metavar="<sst>",
-    #                     help="SST", type=int, default=1)
-    
-    # parser.add_argument("-d", "--sd", metavar="<sd>",
-    #                     help="SD", type=int, default=1)
-    
-    # parser.add_argument("-i", "--influx_end_point", metavar="http://<ip>:port",
-    #                     help="influx db endpoint", type=str, default=None)
-    
-    # parser.add_argument("-o", "--organization", metavar="<organization>",
-    #                     help="influx db organization", type=str, default="docs")
-    
-    # parser.add_argument("-t", "--token", metavar="<token>",
-    #                     help="influx db token", type=str, default="mytoken0==")
-    
-    # parser.add_argument("-b", "--bucket", metavar="<bucket>",
-    #                     help="influx db bucket", type=str, default="xapp_bucket")
-
-    # parser.add_argument("--redis_end_point", metavar="<host:port>",
-    #                     help="Redis endpoint", type=str, default=None)
-    
-    # parser.add_argument("--redis_pwd", metavar="<redis_pwd>",
-    #                     help="Redis password", type=str, default=None)
-
-    # parser.add_argument("-r", "--route_file", metavar="<route_file>",
-    #                     help="path of xApp route file",
-    #                     type=str, default="./config/uta_rtg.rt")
-    
-    # parser.add_argument("-c", "--csv_file", metavar="<csv_file>",
-    #                     help="path of csv file",
-    #                     type=str)
-
-    # parser.add_argument("-g", "--gnb_target", metavar="<gnb_target>",
-    #                     help="gNB to subscribe to",
-    #                     type=str)
-    
-    # args = parser.parse_args()
-    
-    neighbor_list = parse_neighbor_list("neighborhood.conf")
-    #print(json.dumps(neighbor_list, indent=2))
-    gnb_list= get_gnb_list(neighbor_list)
-    print(json.dumps(gnb_list, indent=2))
-    gnb_neighbors = get_gnb_neighbors(neighbor_list, gnb_list)
-    print(json.dumps(gnb_neighbors, indent=2))
-    app = create_app(neighbor_list)
-    app.run(host="0.0.0.0", port=8080, debug=False)
-    # main(args)
 
