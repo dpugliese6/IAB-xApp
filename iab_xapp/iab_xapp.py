@@ -30,6 +30,10 @@ global logger
 
 STALE_TIMEOUT_MS = 5000
 
+# SST and SD ranges for subscriptions
+SST_SET = [1, 2]
+SD_RANGE = list(range(0, 11))  # 0 to 10
+
 # topology_data[i] = list of measurement dicts for gnb_list[i]
 # each dict: {timestamp, sst, sd, ue_id, value_serv, value_neigh_0, ...}
 topology_data        = []
@@ -38,6 +42,7 @@ gnb_neighbors_global = []
 gnb_count_global     = 0
 csv_file_global      = None
 kpm_xapp_global      = None
+iab_associations_global = {}  # gnb_name -> list of (sst, sd)
 
 
 def _upsert_record(gnb_idx, ue_id, sst, sd, record):
@@ -56,6 +61,19 @@ def _cleanup_stale(gnb_idx):
     ]
 
 
+def _cleanup_all_stale():
+    """Remove stale records from all gNBs."""
+    for gnb_idx in range(len(topology_data)):
+        _cleanup_stale(gnb_idx)
+
+
+def _periodic_cleanup():
+    """Background thread that periodically removes stale records."""
+    while True:
+        time.sleep(STALE_TIMEOUT_MS / 1000)
+        _cleanup_all_stale()
+
+
 def write_csv():
     if csv_file_global is None:
         return
@@ -69,9 +87,31 @@ def write_csv():
                 writer.writerow({"gnb_id": gnb_list_global[gnb_idx], **r})
 
 
-def indication_callback(ind_hdr, ind_msg, meid):
+def _extract_slice_from_labels(ind_msg_format_1):
+    """Extract (sst, sd) from the first measurement label that has a sliceID.
+    Tries meas_info_lst_len first, falls back to meas_record_len of the last data entry."""
+    num_info = ind_msg_format_1.meas_info_lst_len
+    if num_info == 0 and ind_msg_format_1.meas_data_lst_len > 0:
+        j = ind_msg_format_1.meas_data_lst_len - 1
+        num_info = ind_msg_format_1.meas_data_lst[j].meas_record_len
+
+    for k in range(num_info):
+        try:
+            meas_info = ind_msg_format_1.meas_info_lst[k]
+            if meas_info.label_info_lst_len > 0 and meas_info.label_info_lst:
+                label = meas_info.label_info_lst[0]
+                if label.sliceID:
+                    sst = label.sliceID.contents.sST
+                    sd = label.sliceID.contents.sD.contents.value if label.sliceID.contents.sD else 0
+                    return int(sst), int(sd)
+        except Exception:
+            continue
+    return None, None
+
+
+def indication_callback(ind_hdr, ind_msg, meid, sub_id=None):
     gnbid = meid.decode('utf-8')
-    logger.info("[Main] Received indication message from {}".format(gnbid))
+    logger.info("[Main] Received indication message from {} (sub_id={})".format(gnbid, sub_id))
     # Decoding sender_name
     sender_name = None
     if ind_hdr.data.kpm_ric_ind_hdr_format_1.sender_name:
@@ -96,6 +136,25 @@ def indication_callback(ind_hdr, ind_msg, meid):
 
             logger.info("[Main] gnb: {}, sender_name: {}, ue: {}".format(gnbid, sender_name, ue_id))
             ind_msg_format_1 = meas_report_ue.ind_msg_format_1
+
+            # Extract sst/sd from measurement labels first, then subscription context
+            sst, sd = _extract_slice_from_labels(ind_msg_format_1)
+            if sst is not None:
+                logger.info("[Main] Extracted slice from labels: sst={} sd={}".format(sst, sd))
+            else:
+                # Try subscription context lookup — sub_id from RMR may be int, keys in context may be str
+                ctx = None
+                if sub_id is not None:
+                    ctx = kpm_xapp_global.subscription_context.get(sub_id) or \
+                          kpm_xapp_global.subscription_context.get(str(sub_id))
+                if ctx:
+                    sst, sd = ctx["sst"], ctx["sd"]
+                    logger.info("[Main] Extracted slice from subscription context (sub_id={}): sst={} sd={}".format(sub_id, sst, sd))
+                else:
+                    sst, sd = 1, 1  # fallback
+                    logger.warning("[Main] Could not extract slice info (sub_id={} type={}, context_keys={}), using default sst={} sd={}".format(
+                        sub_id, type(sub_id).__name__, list(kpm_xapp_global.subscription_context.keys()), sst, sd))
+
             #for j in range(ind_msg_format_1.meas_data_lst_len): #Per each measurement data
             j = (ind_msg_format_1.meas_data_lst_len - 1) # The last one
             meas_data_lst = ind_msg_format_1.meas_data_lst
@@ -140,13 +199,13 @@ def indication_callback(ind_hdr, ind_msg, meid):
 
             record = {
                 "timestamp":  int(time.time() * 1000),
-                "sst":        1,
-                "sd":         1,
+                "sst":        sst,
+                "sd":         sd,
                 "ue_id":      str(ue_id),
-                "value_serv": serv_RSRP,
-                **{f"value_neigh_{i}": neigh_RSRP[i] for i in range(gnb_count_global)},
+                "value_serv": float(serv_RSRP),
+                **{f"value_neigh_{i}": float(neigh_RSRP[i]) for i in range(gnb_count_global)},
             }
-            _upsert_record(gnb_idx, str(ue_id), 1, 1, record)
+            _upsert_record(gnb_idx, str(ue_id), sst, sd, record)
             _cleanup_stale(gnb_idx)
 
         write_csv()
@@ -259,6 +318,40 @@ def parse_neighbor_list(filepath):
 
     return entries
 
+
+def parse_iab_associations(filepath):
+    """Parse iab_associations.conf and return a dict mapping gnb_name -> list of (sst, sd)."""
+    with open(filepath, "r") as f:
+        content = f.read()
+
+    content = strip_comments(content)
+
+    nl_m = re.search(r'iab_nodes\s*=\s*\((.+)\)\s*;', content, re.DOTALL)
+    if not nl_m:
+        raise ValueError("iab_nodes block not found in file")
+
+    associations = {}
+    for block in split_blocks(nl_m.group(1)):
+        plmn_m = re.search(r'plmn\s*=\s*\{([^}]+)\}', block)
+        if not plmn_m:
+            continue
+        plmn = parse_plmn(plmn_m.group(1))
+        gnb_id = get_field("gNB_ID", block)
+        sst = get_field("sst", block)
+        sd = get_field("sd", block)
+        if gnb_id is None or sst is None or sd is None:
+            continue
+
+        mcc_str = str(plmn["mcc"]).zfill(3)
+        mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
+        gnb_id_str = gnb_id if isinstance(gnb_id, str) else str(gnb_id)
+        gnb_name = f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str.zfill(8)}"
+
+        associations.setdefault(gnb_name, []).append((sst, sd))
+
+    return associations
+
+
 def get_gnb_list(neighbor_list):
     result = []
     for entry in neighbor_list:
@@ -266,9 +359,9 @@ def get_gnb_list(neighbor_list):
         mcc_str = str(plmn["mcc"]).zfill(3)
         mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
         gnb_id_str = entry["gNB_ID"].zfill(8)
-
         result.append(f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str}")
     return result
+
 
 def get_gnb_neighbors(neighbor_list, gnb_list):
     result = []
@@ -284,31 +377,6 @@ def get_gnb_neighbors(neighbor_list, gnb_list):
     return result
 
 
-def get_gnb_list(neighbor_list):
-    result = []
-    for entry in neighbor_list:
-        plmn = entry["plmn"]
-        mcc_str = str(plmn["mcc"]).zfill(3)
-        mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
-        gnb_id_str = entry["gNB_ID"].zfill(8)
-        result.append(f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str}")
-    return result
-
-
-def get_gnb_neighbors(neighbor_list, gnb_list):
-    result = []
-    for entry in neighbor_list:
-        neighbors = []
-        for nb in entry["neighbours"]:
-            plmn = nb["plmn"]
-            mcc_str = str(plmn["mcc"]).zfill(3)
-            mnc_str = f"0{plmn['mnc']}" if plmn["mnc_length"] == 2 else str(plmn["mnc"])
-            gnb_id_str = nb["gNB_ID"].zfill(8)
-            neighbors.append(f"gnb_{mcc_str}_{mnc_str}_{gnb_id_str}")
-        result.append(neighbors)
-    return result
-
-    
 def topology_from_memory():
     topology = {gnb: {} for gnb in gnb_list_global}
     for gnb_idx, records in enumerate(topology_data):
@@ -320,39 +388,113 @@ def topology_from_memory():
                 for i, nb_gnb in enumerate(nb_list)
                 if r.get(f"value_neigh_{i}", 0) != 0
             }
-            topology[gnb_id][r["ue_id"]] = {
+            ue_key = "{}:sst{}sd{}".format(r["ue_id"], r["sst"], r["sd"])
+            topology[gnb_id][ue_key] = {
+                "ue_id":         r["ue_id"],
+                "sst":           r["sst"],
+                "sd":            r["sd"],
                 "serving_rsrp":  r["value_serv"],
                 "neighbor_rsrp": neighbor_rsrp,
             }
     return topology
 
-    
-def build_graph(gnb_list, gnb_neighbors, topology):
+
+def build_graph(gnb_list, gnb_neighbors, topology, iab_associations):
     nodes, edges = [], []
     seen_edges = set()
 
-    for gnb in gnb_list:
-        nodes.append({"id": gnb, "type": "gnb", "label": gnb})
+    # Collect UEs that belong to an IAB node (they will be merged into the IAB node)
+    # iab_ue_keys: set of ue_keys absorbed into an IAB node
+    iab_ue_keys = set()
+    # iab_ues: iab_gnb -> list of UE labels absorbed
+    iab_ues = {gnb: [] for gnb in iab_associations}
 
     for gnb_id, ues in topology.items():
-        for ue_id, data in ues.items():
-            nodes.append({"id": ue_id, "type": "ue", "label": ue_id})
-            edges.append({
-                "from":  ue_id,
-                "to":    gnb_id,
-                "style": "solid",
-                "rsrp":  data["serving_rsrp"],
+        for ue_key, data in ues.items():
+            for iab_gnb, slices in iab_associations.items():
+                if (data["sst"], data["sd"]) in slices:
+                    iab_ue_keys.add(ue_key)
+                    iab_ues[iab_gnb].append("UE {} (s{}/d{})".format(data["ue_id"], data["sst"], data["sd"]))
+                    break
+
+    # Build gNB / IAB nodes
+    for gnb in gnb_list:
+        is_iab = gnb in iab_associations
+        if is_iab:
+            absorbed = iab_ues.get(gnb, [])
+            label = gnb + "\n" + "\n".join(absorbed) if absorbed else gnb
+            nodes.append({
+                "id": gnb,
+                "type": "iab",
+                "label": label,
+                "ue_count": len(absorbed),
             })
-            for nb_gnb, nb_rsrp in data["neighbor_rsrp"].items():
-                key = (ue_id, nb_gnb)
-                if key not in seen_edges:
-                    seen_edges.add(key)
-                    edges.append({
-                        "from":  ue_id,
-                        "to":    nb_gnb,
-                        "style": "dashdot",
-                        "rsrp":  nb_rsrp,
-                    })
+        else:
+            nodes.append({
+                "id": gnb,
+                "type": "gnb",
+                "label": gnb,
+            })
+
+    # Build UE nodes and edges (skip UEs absorbed into IAB nodes)
+    for gnb_id, ues in topology.items():
+        for ue_key, data in ues.items():
+            if ue_key in iab_ue_keys:
+                # This UE is merged into an IAB node — redirect its edges
+                # Find which IAB node absorbed it
+                merged_into = None
+                for iab_gnb, slices in iab_associations.items():
+                    if (data["sst"], data["sd"]) in slices:
+                        merged_into = iab_gnb
+                        break
+                # Add serving edge from IAB node to serving gNB (if different)
+                if merged_into and merged_into != gnb_id:
+                    edge_key = (merged_into, gnb_id, "serving")
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        edges.append({
+                            "from":  merged_into,
+                            "to":    gnb_id,
+                            "style": "solid",
+                            "rsrp":  data["serving_rsrp"],
+                        })
+                # Add neighbor edges from IAB node
+                for nb_gnb, nb_rsrp in data["neighbor_rsrp"].items():
+                    if nb_gnb == merged_into:
+                        continue
+                    edge_key = (merged_into, nb_gnb, "neigh")
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        edges.append({
+                            "from":  merged_into,
+                            "to":    nb_gnb,
+                            "style": "dashdot",
+                            "rsrp":  nb_rsrp,
+                        })
+            else:
+                # Regular UE — show as separate node
+                ue_label = "{} (s{}/d{})".format(data["ue_id"], data["sst"], data["sd"])
+                nodes.append({
+                    "id": ue_key,
+                    "type": "ue",
+                    "label": ue_label,
+                })
+                edges.append({
+                    "from":  ue_key,
+                    "to":    gnb_id,
+                    "style": "solid",
+                    "rsrp":  data["serving_rsrp"],
+                })
+                for nb_gnb, nb_rsrp in data["neighbor_rsrp"].items():
+                    key = (ue_key, nb_gnb)
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        edges.append({
+                            "from":  ue_key,
+                            "to":    nb_gnb,
+                            "style": "dashdot",
+                            "rsrp":  nb_rsrp,
+                        })
 
     return {"nodes": nodes, "edges": edges}
 
@@ -375,9 +517,14 @@ HTML = """<!DOCTYPE html>
     font-size: 13px;
   }
   .leg-item { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
-  .leg-line { width: 36px; height: 3px; }
-  .solid   { background: #74c0fc; }
-  .dashdot { background: repeating-linear-gradient(90deg,#f08c00 0,#f08c00 6px,transparent 6px,transparent 10px); }
+  .leg-line  { width: 36px; height: 3px; }
+  .leg-shape { width: 18px; height: 18px; display: inline-block; }
+  .solid     { background: #74c0fc; }
+  .dashdot   { background: repeating-linear-gradient(90deg,#f08c00 0,#f08c00 6px,transparent 6px,transparent 10px); }
+  .iab-line  { background: #e599f7; }
+  .gnb-shape { background: #4dabf7; clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%); }
+  .iab-shape { background: #e599f7; clip-path: polygon(50% 0%, 100% 100%, 0% 100%); }
+  .ue-shape  { background: #a9e34b; border-radius: 50%; }
   #status {
     position: absolute; top: 60px; right: 16px;
     background: rgba(0,0,0,0.6); border-radius: 8px; padding: 6px 12px;
@@ -388,31 +535,43 @@ HTML = """<!DOCTYPE html>
 <body>
 <h2>Network Topology</h2>
 <div id="legend">
+  <div class="leg-item"><div class="leg-shape gnb-shape"></div> gNB</div>
+  <div class="leg-item"><div class="leg-shape iab-shape"></div> IAB node</div>
+  <div class="leg-item"><div class="leg-shape ue-shape"></div> UE</div>
+  <hr style="border-color:#555; margin:6px 0;">
   <div class="leg-item"><div class="leg-line solid"></div> Serving (solid)</div>
-  <div class="leg-item"><div class="leg-line dashdot"></div> Neighbour measurement (dash-dot)</div>
+  <div class="leg-item"><div class="leg-line dashdot"></div> Neighbour (dash-dot)</div>
+  <div class="leg-item"><div class="leg-line iab-line"></div> IAB cluster</div>
 </div>
 <div id="status">Waiting for data...</div>
 <div id="net"></div>
 <script>
+const IAB_COLOR   = { background: "#e599f7", border: "#9c36b5" };
+const GNB_COLOR   = { background: "#4dabf7", border: "#1971c2" };
+const UE_COLOR    = { background: "#a9e34b", border: "#5c940d" };
+const IAB_UE_COLOR = { background: "#d0bfff", border: "#7048e8" };
+
 function toVisNode(n) {
+  const isIab   = n.type === "iab";
+  const isUe    = n.type === "ue";
   return {
     id: n.id, label: n.label,
-    shape: n.type === "gnb" ? "diamond" : "dot",
-    size:  n.type === "gnb" ? 28 : 14,
-    color: n.type === "gnb"
-      ? { background: "#4dabf7", border: "#1971c2" }
-      : { background: "#a9e34b", border: "#5c940d" },
-    font: { color: "#fff", size: 11 },
+    shape: isIab ? "box" : (isUe ? "dot" : "diamond"),
+    size:  isUe ? 14 : 28,
+    color: isIab ? IAB_COLOR : (isUe ? UE_COLOR : GNB_COLOR),
+    font:  { color: "#fff", size: 11, multi: "md" },
+    margin: isIab ? 10 : undefined,
   };
 }
 
 function toVisEdge(e, i) {
+  const isIab = e.style === "iab_cluster";
   return {
     id: i, from: e.from, to: e.to,
-    label:  e.rsrp.toFixed(1) + " dBm",
-    color:  { color: e.style === "solid" ? "#74c0fc" : "#f08c00" },
-    dashes: e.style === "dashdot" ? [6, 4, 2, 4] : false,
-    width:  e.style === "solid" ? 2.5 : 1.5,
+    label:  e.rsrp !== undefined ? e.rsrp.toFixed(1) + " dBm" : "",
+    color:  { color: isIab ? "#e599f7" : (e.style === "solid" ? "#74c0fc" : "#f08c00") },
+    dashes: e.style === "dashdot" ? [6, 4, 2, 4] : (isIab ? [2, 4] : false),
+    width:  isIab ? 2 : (e.style === "solid" ? 2.5 : 1.5),
     font:   { size: 9, color: "#ccc", align: "middle" },
     smooth: { type: "curvedCW", roundness: 0.2 },
   };
@@ -467,6 +626,10 @@ setInterval(refresh, 5000);
 def create_app():
     app = Flask(__name__)
 
+    @app.route("/health")
+    def health():
+        return jsonify({"status": "ok"})
+
     @app.route("/")
     def index():
         return render_template_string(HTML)
@@ -474,68 +637,68 @@ def create_app():
     @app.route("/graph")
     def graph():
         topology = topology_from_memory()
-        return jsonify(build_graph(gnb_list_global, gnb_neighbors_global, topology))
+        return jsonify(build_graph(gnb_list_global, gnb_neighbors_global, topology, iab_associations_global))
 
     return app
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="kpm xApp")
-    
-    parser.add_argument("-s", "--sst", metavar="<sst>",
-                        help="SST", type=int, default=1)
-    
-    parser.add_argument("-d", "--sd", metavar="<sd>",
-                        help="SD", type=int, default=1)
-
+    parser = argparse.ArgumentParser(description="kpm xApp v3")
 
     parser.add_argument("-r", "--route_file", metavar="<route_file>",
                         help="path of xApp route file",
                         type=str, default="./config/uta_rtg.rt")
 
-
-    parser.add_argument("-g", "--gnb_target", metavar="<gnb_target>",
-                        help="gNB to subscribe to",
-                        type=str)
-    
     args = parser.parse_args()
-    
+
     neighbor_list = parse_neighbor_list("neighborhood.conf")
-    #print(json.dumps(neighbor_list, indent=2))
-    gnb_list= get_gnb_list(neighbor_list)
+    gnb_list = get_gnb_list(neighbor_list)
     print(json.dumps(gnb_list, indent=2))
     gnb_neighbors = get_gnb_neighbors(neighbor_list, gnb_list)
     print(json.dumps(gnb_neighbors, indent=2))
-    #global logger
-        
+
+    # Parse IAB associations
+    iab_associations = parse_iab_associations("iab_associations.conf")
+    print("IAB associations:", json.dumps({k: v for k, v in iab_associations.items()}, indent=2))
+
     # Creating a generic xDevSM RMR xApp
     xapp_gen = xDevSMRMRXapp("0.0.0.0", route_file=args.route_file)
     logger = xapp_gen.logger
 
-    
+
     # Adding kpm functionalities to the xapp
-    kpm_xapp = XappKpmFrame(xapp_gen, 
-                            logger, 
-                            xapp_gen.server, 
-                            xapp_gen.get_xapp_name(), 
-                            xapp_gen.rmr_port, 
-                            xapp_gen.http_port,xapp_gen.get_pltnamespace(), 
+    kpm_xapp = XappKpmFrame(xapp_gen,
+                            logger,
+                            xapp_gen.server,
+                            xapp_gen.get_xapp_name(),
+                            xapp_gen.rmr_port,
+                            xapp_gen.http_port,xapp_gen.get_pltnamespace(),
                             xapp_gen.get_app_namespace())
-    
+
     # Initialise global topology state
     gnb_list_global      = gnb_list
     gnb_neighbors_global = gnb_neighbors
     gnb_count_global     = len(gnb_list) - 1
     csv_file_global      = "network_topology.csv"
     kpm_xapp_global      = kpm_xapp
+    iab_associations_global = iab_associations
     topology_data        = [[] for _ in gnb_list]
 
     # Start Flask web server in background thread
     flask_app = create_app()
-    flask_thread = threading.Thread(
-        target=lambda: flask_app.run(host="0.0.0.0", port=8080, debug=False),
-        daemon=True,
-    )
+
+    def run_flask():
+        try:
+            flask_app.run(host="0.0.0.0", port=5555, debug=False, threaded=True)
+        except Exception as e:
+            logger.error("[Flask] Web server crashed: {}".format(e))
+
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
+    logger.info("[Main] Flask web server started on port 5555")
+
+    # Start periodic stale-data cleanup thread
+    cleanup_thread = threading.Thread(target=_periodic_cleanup, daemon=True)
+    cleanup_thread.start()
 
     # Registering the shutdown function
     xapp_gen.register_shutdown(shutdown)
@@ -552,49 +715,78 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, kpm_xapp.terminate)
     signal.signal(signal.SIGTERM, kpm_xapp.terminate)
 
-    gnb, gnb_info = xapp_gen.get_selected_e2node_info(args.gnb_target)
-    if not gnb:
-        logger.info("[Main] Terminating xapp")
-        kpm_xapp.terminate(signal.SIGTERM, None)
-        sys.exit(1)
-    
-    # There exist one gnb available
-    ran_function_description = kpm_xapp.get_ran_function_description(json_ran_info=gnb_info)
-    func_def_dict = ran_function_description.get_dict_of_values()
-        
-    logger.debug("[Main] Available functions: {}".format(func_def_dict))
-
-    # Only one ran function format at time is supported for now
-    # Selecting format 4 or 1 (these are coherent with the wrapper provided)
-    # If you want to support more formats, change function gen_action_definition in wrapper
-    func_def_sub_dict = {}
-    selected_format = format_action_def_e.END_ACTION_DEFINITION
-    if len(func_def_dict[format_action_def_e.FORMAT_4_ACTION_DEFINITION]) == 0:
-        selected_format = format_action_def_e.FORMAT_1_ACTION_DEFINITION
-    else:
-        selected_format = format_action_def_e.FORMAT_4_ACTION_DEFINITION
-    
-    if selected_format == format_action_def_e.END_ACTION_DEFINITION:
-        logger.error("[Main] No supported action definition format")
-        kpm_xapp.terminate(signal.SIGTERM, None)
-        sys.exit(1)
-
-    # Selecting only supported action definition
-    func_def_sub_dict[selected_format] = func_def_dict[selected_format]
-
-    logger.debug("[Main] Selected functions: {}".format(func_def_dict[selected_format]))
     time.sleep(10)
-    # Sending subscription
+
+    # Track which gNBs have been successfully subscribed
+    subscribed_gnbs = set()
     ev_trigger_tuple = (0, 1000)
-    status = kpm_xapp.subscribe(gnb=gnb, ev_trigger=ev_trigger_tuple, func_def=func_def_sub_dict,  ran_period_ms=1000, sst=args.sst, sd=args.sd)
 
-    if status != 201:
-        logger.error("[Main] something during subscription went wrong - status: {}".format(status))
-        sys.exit(1)
+    def subscribe_to_gnb(gnb_name):
+        """Try to subscribe to a single gNB for all (sst, sd) combinations."""
+        gnb, gnb_info = xapp_gen.get_selected_e2node_info(gnb_name)
+        if not gnb:
+            return False
 
-    # Start running after finishing subscription requests
+        ran_function_description = kpm_xapp.get_ran_function_description(json_ran_info=gnb_info)
+        func_def_dict = ran_function_description.get_dict_of_values()
+        logger.debug("[Main] gNB {} - Available functions: {}".format(gnb_name, func_def_dict))
 
+        # Select format 4 or 1
+        func_def_sub_dict = {}
+        selected_format = format_action_def_e.END_ACTION_DEFINITION
+        if len(func_def_dict[format_action_def_e.FORMAT_4_ACTION_DEFINITION]) == 0:
+            selected_format = format_action_def_e.FORMAT_1_ACTION_DEFINITION
+        else:
+            selected_format = format_action_def_e.FORMAT_4_ACTION_DEFINITION
+
+        if selected_format == format_action_def_e.END_ACTION_DEFINITION:
+            logger.error("[Main] gNB {} - No supported action definition format".format(gnb_name))
+            return False
+
+        func_def_sub_dict[selected_format] = func_def_dict[selected_format]
+        logger.debug("[Main] gNB {} - Selected functions: {}".format(gnb_name, func_def_dict[selected_format]))
+
+        all_ok = True
+        for sst in SST_SET:
+            for sd in SD_RANGE:
+                status = kpm_xapp.subscribe(
+                    gnb=gnb,
+                    ev_trigger=ev_trigger_tuple,
+                    func_def=func_def_sub_dict,
+                    ran_period_ms=1000,
+                    sst=sst,
+                    sd=sd,
+                )
+                if status != 201:
+                    logger.error("[Main] gNB {} sst={} sd={} - subscription failed (status: {})".format(
+                        gnb_name, sst, sd, status))
+                    all_ok = False
+                else:
+                    logger.info("[Main] gNB {} sst={} sd={} - subscription OK".format(gnb_name, sst, sd))
+        return all_ok
+
+    def subscription_loop():
+        """Periodically attempt to subscribe to gNBs that are not yet subscribed."""
+        while True:
+            missing = [g for g in gnb_list if g not in subscribed_gnbs]
+            if not missing:
+                logger.info("[Sub] All gNBs subscribed")
+                break
+            for gnb_name in missing:
+                try:
+                    logger.info("[Sub] Trying to subscribe to {}...".format(gnb_name))
+                    if subscribe_to_gnb(gnb_name):
+                        subscribed_gnbs.add(gnb_name)
+                        logger.info("[Sub] Successfully subscribed to {}".format(gnb_name))
+                    else:
+                        logger.warning("[Sub] gNB {} not available yet, will retry".format(gnb_name))
+                except Exception as e:
+                    logger.error("[Sub] gNB {} - exception during subscribe: {}, will retry".format(gnb_name, e))
+            time.sleep(10)
+
+    sub_thread = threading.Thread(target=subscription_loop, daemon=True)
+    sub_thread.start()
+
+    # Start running
     logger.info("[Main] Starting xapp")
     xapp_gen.run()
-
-
