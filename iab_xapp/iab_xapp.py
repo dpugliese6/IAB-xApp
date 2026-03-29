@@ -1,17 +1,12 @@
 import time
 import signal
 import argparse
-import influxdb_client
-import redis
 import numpy as np
-import pandas as pd
-from influxdb_client.client.write_api import SYNCHRONOUS
 import re
 import csv
 import threading
 from flask import Flask, jsonify, render_template_string
 import json
-import sys
 
 import setup_imports
 
@@ -43,6 +38,7 @@ gnb_count_global     = 0
 csv_file_global      = None
 kpm_xapp_global      = None
 iab_associations_global = {}  # gnb_name -> list of (sst, sd)
+subscribed_gnbs_global = set()  # gnb_name -> currently subscribed/connected
 
 
 def _upsert_record(gnb_idx, ue_id, sst, sd, record):
@@ -155,57 +151,62 @@ def indication_callback(ind_hdr, ind_msg, meid, sub_id=None):
                     logger.warning("[Main] Could not extract slice info (sub_id={} type={}, context_keys={}), using default sst={} sd={}".format(
                         sub_id, type(sub_id).__name__, list(kpm_xapp_global.subscription_context.keys()), sst, sd))
 
-            #for j in range(ind_msg_format_1.meas_data_lst_len): #Per each measurement data
-            j = (ind_msg_format_1.meas_data_lst_len - 1) # The last one
             meas_data_lst = ind_msg_format_1.meas_data_lst
-            serv_vals = []
-            neigh_vals = {}  # { n: [values...] }
             neigh_pattern = re.compile(r'L1M\.SS-RSRPNrNbr\.(\d+)\.\d+')
             serv_pattern  = re.compile(r'L1M\.SS-RSRP\.\d+')
 
-            for k in range(meas_data_lst[j].meas_record_len):
-                meas_record_lst_el = meas_data_lst[j].meas_record_lst[k]
-                if ind_msg_format_1.meas_info_lst[k].meas_type.type.value == meas_type_enum.NAME_MEAS_TYPE:
-                    meas_type     = ind_msg_format_1.meas_info_lst[k].meas_type.value.name
-                    meas_record   = meas_record_lst_el
+            for j in range(ind_msg_format_1.meas_data_lst_len):
+                serv_vals = []
+                neigh_vals = {}  # { n: [values...] }
 
-                    meas_type_bs  = bytes(np.ctypeslib.as_array(meas_type.buf, shape=(meas_type.len,)))
-                    meas_type_str = meas_type_bs.decode('utf-8')
+                for k in range(meas_data_lst[j].meas_record_len):
+                    meas_record_lst_el = meas_data_lst[j].meas_record_lst[k]
+                    if ind_msg_format_1.meas_info_lst[k].meas_type.type.value == meas_type_enum.NAME_MEAS_TYPE:
+                        meas_type     = ind_msg_format_1.meas_info_lst[k].meas_type.value.name
+                        meas_record   = meas_record_lst_el
 
-                    if meas_record.value.value == meas_value_e.INTEGER_MEAS_VALUE:
-                        val = meas_record.union.int_val
-                    elif meas_record.value.value == meas_value_e.REAL_MEAS_VALUE:
-                        val = meas_record.union.real_val
+                        meas_type_bs  = bytes(np.ctypeslib.as_array(meas_type.buf, shape=(meas_type.len,)))
+                        meas_type_str = meas_type_bs.decode('utf-8')
+
+                        if meas_record.value.value == meas_value_e.INTEGER_MEAS_VALUE:
+                            val = meas_record.union.int_val
+                        elif meas_record.value.value == meas_value_e.REAL_MEAS_VALUE:
+                            val = meas_record.union.real_val
+                        else:
+                            continue
+
+                        logger.info("{}:{}".format(meas_type_str, val))
+
+                        if serv_pattern.fullmatch(meas_type_str):
+                            serv_vals.append(val)
+
+                        elif m := neigh_pattern.fullmatch(meas_type_str):
+                            n = int(m.group(1))
+                            neigh_vals.setdefault(n, []).append(val)
                     else:
-                        continue
+                        logger.info("[Main] Not supported meas type {}".format(ind_msg_format_1.meas_info_lst[k].meas_type.type.value))
 
-                    logger.info("{}:{}".format(meas_type_str, val))
+                # After inner loop — compute and discard if serv_RSRP is 0
+                serv_RSRP = np.mean([v for v in serv_vals if v != 0]) if any(v != 0 for v in serv_vals) else 0
+                if serv_RSRP == 0:
+                    continue
 
-                    if serv_pattern.fullmatch(meas_type_str):
-                        serv_vals.append(val)
+                neigh_RSRP = np.full(gnb_count_global, 0)
+                for n, vals in neigh_vals.items():
+                    non_zero = [v for v in vals if v != 0]
+                    if non_zero:
+                        neigh_RSRP[n] = np.mean(non_zero)
 
-                    elif m := neigh_pattern.fullmatch(meas_type_str):
-                        n = int(m.group(1))
-                        neigh_vals.setdefault(n, []).append(val)
-                else:
-                    logger.info("[Main] Not supported meas type {}".format(ind_msg_format_1.meas_info_lst[k].meas_type.type.value))
-            # After the loop
-            serv_RSRP = np.mean([v for v in serv_vals if v != 0]) if any(v != 0 for v in serv_vals) else 0
-            neigh_RSRP = np.full(gnb_count_global, 0)
-            for n, vals in neigh_vals.items():
-                non_zero = [v for v in vals if v != 0]
-                if non_zero:
-                    neigh_RSRP[n] = np.mean(non_zero)
+                record = {
+                    "timestamp":  int(time.time() * 1000),
+                    "sst":        sst,
+                    "sd":         sd,
+                    "ue_id":      str(ue_id),
+                    "value_serv": float(serv_RSRP),
+                    **{f"value_neigh_{i}": float(neigh_RSRP[i]) for i in range(gnb_count_global)},
+                }
+                _upsert_record(gnb_idx, str(ue_id), sst, sd, record)
 
-            record = {
-                "timestamp":  int(time.time() * 1000),
-                "sst":        sst,
-                "sd":         sd,
-                "ue_id":      str(ue_id),
-                "value_serv": float(serv_RSRP),
-                **{f"value_neigh_{i}": float(neigh_RSRP[i]) for i in range(gnb_count_global)},
-            }
-            _upsert_record(gnb_idx, str(ue_id), sst, sd, record)
             _cleanup_stale(gnb_idx)
 
         write_csv()
@@ -399,9 +400,11 @@ def topology_from_memory():
     return topology
 
 
-def build_graph(gnb_list, gnb_neighbors, topology, iab_associations):
+def build_graph(gnb_list, gnb_neighbors, topology, iab_associations, connected_gnbs=None):
     nodes, edges = [], []
     seen_edges = set()
+    if connected_gnbs is None:
+        connected_gnbs = set(gnb_list)
 
     # Collect UEs that belong to an IAB node (they will be merged into the IAB node)
     # iab_ue_keys: set of ue_keys absorbed into an IAB node
@@ -420,6 +423,7 @@ def build_graph(gnb_list, gnb_neighbors, topology, iab_associations):
     # Build gNB / IAB nodes
     for gnb in gnb_list:
         is_iab = gnb in iab_associations
+        connected = gnb in connected_gnbs
         if is_iab:
             absorbed = iab_ues.get(gnb, [])
             label = gnb + "\n" + "\n".join(absorbed) if absorbed else gnb
@@ -428,12 +432,14 @@ def build_graph(gnb_list, gnb_neighbors, topology, iab_associations):
                 "type": "iab",
                 "label": label,
                 "ue_count": len(absorbed),
+                "connected": connected,
             })
         else:
             nodes.append({
                 "id": gnb,
                 "type": "gnb",
                 "label": gnb,
+                "connected": connected,
             })
 
     # Build UE nodes and edges (skip UEs absorbed into IAB nodes)
@@ -521,10 +527,10 @@ HTML = """<!DOCTYPE html>
   .leg-shape { width: 18px; height: 18px; display: inline-block; }
   .solid     { background: #74c0fc; }
   .dashdot   { background: repeating-linear-gradient(90deg,#f08c00 0,#f08c00 6px,transparent 6px,transparent 10px); }
-  .iab-line  { background: #e599f7; }
-  .gnb-shape { background: #4dabf7; clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%); }
-  .iab-shape { background: #e599f7; clip-path: polygon(50% 0%, 100% 100%, 0% 100%); }
-  .ue-shape  { background: #a9e34b; border-radius: 50%; }
+  .gnb-shape  { background: #4dabf7; border-radius: 3px; }
+  .iab-shape  { background: #e599f7; border-radius: 3px; }
+  .ue-shape   { background: #a9e34b; border-radius: 50%; }
+  .disc-shape { background: #555; border-radius: 3px; opacity: 0.4; }
   #status {
     position: absolute; top: 60px; right: 16px;
     background: rgba(0,0,0,0.6); border-radius: 8px; padding: 6px 12px;
@@ -536,42 +542,43 @@ HTML = """<!DOCTYPE html>
 <h2>Network Topology</h2>
 <div id="legend">
   <div class="leg-item"><div class="leg-shape gnb-shape"></div> gNB</div>
-  <div class="leg-item"><div class="leg-shape iab-shape"></div> IAB node</div>
+  <div class="leg-item"><div class="leg-shape iab-shape"></div> IAB node (+ merged UEs)</div>
   <div class="leg-item"><div class="leg-shape ue-shape"></div> UE</div>
+  <div class="leg-item"><div class="leg-shape disc-shape"></div> Disconnected</div>
   <hr style="border-color:#555; margin:6px 0;">
-  <div class="leg-item"><div class="leg-line solid"></div> Serving (solid)</div>
-  <div class="leg-item"><div class="leg-line dashdot"></div> Neighbour (dash-dot)</div>
-  <div class="leg-item"><div class="leg-line iab-line"></div> IAB cluster</div>
+  <div class="leg-item"><div class="leg-line solid"></div> Serving</div>
+  <div class="leg-item"><div class="leg-line dashdot"></div> Neighbor</div>
 </div>
 <div id="status">Waiting for data...</div>
 <div id="net"></div>
 <script>
-const IAB_COLOR   = { background: "#e599f7", border: "#9c36b5" };
-const GNB_COLOR   = { background: "#4dabf7", border: "#1971c2" };
-const UE_COLOR    = { background: "#a9e34b", border: "#5c940d" };
-const IAB_UE_COLOR = { background: "#d0bfff", border: "#7048e8" };
+const IAB_COLOR  = { background: "#e599f7", border: "#9c36b5" };
+const GNB_COLOR  = { background: "#4dabf7", border: "#1971c2" };
+const UE_COLOR   = { background: "#a9e34b", border: "#5c940d" };
+const DISC_COLOR = { background: "#555", border: "#888" };
 
 function toVisNode(n) {
-  const isIab   = n.type === "iab";
-  const isUe    = n.type === "ue";
+  const isUe = n.type === "ue";
+  const disconnected = !isUe && n.connected === false;
+  const color = disconnected ? DISC_COLOR : (n.type === "iab" ? IAB_COLOR : (isUe ? UE_COLOR : GNB_COLOR));
   return {
     id: n.id, label: n.label,
-    shape: isIab ? "box" : (isUe ? "dot" : "diamond"),
+    shape: isUe ? "dot" : "box",
     size:  isUe ? 14 : 28,
-    color: isIab ? IAB_COLOR : (isUe ? UE_COLOR : GNB_COLOR),
-    font:  { color: "#fff", size: 11, multi: "md" },
-    margin: isIab ? 10 : undefined,
+    color: color,
+    opacity: disconnected ? 0.4 : 1.0,
+    font:  { color: disconnected ? "#aaa" : "#fff", size: 11, multi: "md" },
+    margin: isUe ? undefined : 10,
   };
 }
 
 function toVisEdge(e, i) {
-  const isIab = e.style === "iab_cluster";
   return {
     id: i, from: e.from, to: e.to,
     label:  e.rsrp !== undefined ? e.rsrp.toFixed(1) + " dBm" : "",
-    color:  { color: isIab ? "#e599f7" : (e.style === "solid" ? "#74c0fc" : "#f08c00") },
-    dashes: e.style === "dashdot" ? [6, 4, 2, 4] : (isIab ? [2, 4] : false),
-    width:  isIab ? 2 : (e.style === "solid" ? 2.5 : 1.5),
+    color:  { color: e.style === "solid" ? "#74c0fc" : "#f08c00" },
+    dashes: e.style === "dashdot" ? [6, 4, 2, 4] : false,
+    width:  e.style === "solid" ? 2.5 : 1.5,
     font:   { size: 9, color: "#ccc", align: "middle" },
     smooth: { type: "curvedCW", roundness: 0.2 },
   };
@@ -637,7 +644,7 @@ def create_app():
     @app.route("/graph")
     def graph():
         topology = topology_from_memory()
-        return jsonify(build_graph(gnb_list_global, gnb_neighbors_global, topology, iab_associations_global))
+        return jsonify(build_graph(gnb_list_global, gnb_neighbors_global, topology, iab_associations_global, subscribed_gnbs_global))
 
     return app
 
@@ -717,8 +724,8 @@ if __name__ == '__main__':
 
     time.sleep(10)
 
-    # Track which gNBs have been successfully subscribed
-    subscribed_gnbs = set()
+    # Track which gNBs have been successfully subscribed (also exposed to Flask via subscribed_gnbs_global)
+    subscribed_gnbs = subscribed_gnbs_global
     ev_trigger_tuple = (0, 1000)
 
     def subscribe_to_gnb(gnb_name):
@@ -766,12 +773,24 @@ if __name__ == '__main__':
         return all_ok
 
     def subscription_loop():
-        """Periodically attempt to subscribe to gNBs that are not yet subscribed."""
+        """Periodically attempt to subscribe to gNBs that are not yet subscribed,
+        and detect disconnected gNBs to re-subscribe when they come back."""
         while True:
+            # Check already-subscribed gNBs for disconnection
+            for gnb_name in list(subscribed_gnbs):
+                gnb, _ = xapp_gen.get_selected_e2node_info(gnb_name)
+                if gnb is None:
+                    logger.warning("[Sub] gNB {} appears disconnected, cleaning up subscriptions".format(gnb_name))
+                    for sub_id in list(kpm_xapp.subscription_id.get(gnb_name, [])):
+                        try:
+                            kpm_xapp.subscriber.Unsubscribe(sub_id)
+                        except Exception:
+                            pass
+                    kpm_xapp.subscription_id.pop(gnb_name, None)
+                    subscribed_gnbs.discard(gnb_name)
+
+            # Try to subscribe to missing/reconnected gNBs
             missing = [g for g in gnb_list if g not in subscribed_gnbs]
-            if not missing:
-                logger.info("[Sub] All gNBs subscribed")
-                break
             for gnb_name in missing:
                 try:
                     logger.info("[Sub] Trying to subscribe to {}...".format(gnb_name))
