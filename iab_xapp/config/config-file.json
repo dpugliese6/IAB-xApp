@@ -1,13 +1,13 @@
 {
     "name": "iab-xapp",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "containers": [
         {
             "name": "iab-xapp",
             "image": {
                 "registry": "docker.io",
                 "name": "dpugliese6/iab-xapp",
-                "tag": "0.0.1"
+                "tag": "0.0.2"
             }
         }
     ],

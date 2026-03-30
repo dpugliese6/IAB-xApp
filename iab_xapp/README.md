@@ -7,12 +7,14 @@ Once this is done, I file will be created where e fixed topology has been define
 
 # Deploy
 ```
-docker build --tag iab-xapp:0.0.1 --file docker/Dockerfile.iab_xapp .
-docker tag iab-xapp:0.0.1 dpugliese6/iab-xapp:0.0.1
-docker push dpugliese6/iab-xapp:0.0.1
+sudo docker build --tag iab-xapp:0.0.2 --file docker/Dockerfile.iab_xapp .
+sudo docker tag iab-xapp:0.0.2 dpugliese6/iab-xapp:0.0.2
+sudo docker push dpugliese6/iab-xapp:0.0.2
+cd
 cd ric-plt-appmgr/xapp_orchestrater/dev/xapp_onboarder/
 . .venv/bin/activate
+export CHART_REPO_URL=http://0.0.0.0:8090
 dms_cli onboard --config-file-path iab_xapp/config/config-file.json --shcema_file_path  iab_xapp/config/schema.json
-dms_cli download_helm_chart iab-xapp 0.0.1 
-helm install iab-xapp iab-xapp-0.0.1.tgz -n ricxapp
+dms_cli download_helm_chart iab-xapp 0.0.2 
+helm install iab-xapp iab-xapp-0.0.2.tgz -n ricxapp
 ```
