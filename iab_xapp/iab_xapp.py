@@ -111,11 +111,25 @@ def indication_callback(ind_hdr, ind_msg, meid, sub_id=None):
             if serv_RSRP == 0:
                 continue
 
-            neigh_RSRP = np.full(state.gnb_count_global, 0)
-            for n, vals in neigh_vals.items():
+            ue_key     = "{}:sst{}sd{}".format(str(ue_id), sst, sd)
+            existing   = topo.get_record(gnb_idx, str(ue_id), sst, sd)
+            zero_counts = state.neigh_zero_counts \
+                              .setdefault(gnbid, {}) \
+                              .setdefault(ue_key, {})
+
+            neigh_RSRP = np.full(state.gnb_count_global, 0.0)
+            for n in range(state.gnb_count_global):
+                vals     = neigh_vals.get(n, [])
                 non_zero = [v for v in vals if v != 0]
                 if non_zero:
-                    neigh_RSRP[n] = np.mean(non_zero)
+                    neigh_RSRP[n]  = np.mean(non_zero)
+                    zero_counts[n] = 0
+                else:
+                    count          = zero_counts.get(n, 0) + 1
+                    zero_counts[n] = count
+                    if count < 5 and existing:
+                        neigh_RSRP[n] = existing.get(f"value_neigh_{n}", 0.0)
+                    # count >= 5: stays 0 (neighbor considered gone)
 
             record = {
                 "timestamp":  int(time.time() * 1000),

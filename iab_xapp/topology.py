@@ -13,6 +13,13 @@ import state
 
 # ── In-memory store helpers ───────────────────────────────────────────────────
 
+def get_record(gnb_idx, ue_id, sst, sd):
+    for r in state.topology_data[gnb_idx]:
+        if r["ue_id"] == ue_id and r["sst"] == sst and r["sd"] == sd:
+            return r
+    return None
+
+
 def upsert_record(gnb_idx, ue_id, sst, sd, record):
     for i, r in enumerate(state.topology_data[gnb_idx]):
         if r["ue_id"] == ue_id and r["sst"] == sst and r["sd"] == sd:

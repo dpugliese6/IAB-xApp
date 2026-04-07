@@ -20,5 +20,6 @@ csv_file_global         = None
 kpm_xapp_global         = None
 iab_associations_global = {}   # gnb_name -> list of (sst, sd)
 subscribed_gnbs_global  = set() # gnb_names currently subscribed/connected
+neigh_zero_counts       = {}   # gnb_name -> {ue_key -> {neigh_idx -> consecutive_zero_count}}
 
 logger = None
