@@ -28,13 +28,28 @@ def compute_ho_decisions(topology):
     """
     Returns a list of HO decisions, each a dict:
       ue_key, ue_id, current_gnb, target_gnb, current_rsrp, target_rsrp
+
+    For IAB backhaul UEs (whose sst/sd match an IAB association), the IAB
+    node's own gNB identity is excluded from HO candidates to prevent
+    self-attachment loops.
     """
+    # Reverse map: (sst, sd) -> IAB gNB name that owns this backhaul slice
+    iab_slice_owner = {
+        s: gnb_name
+        for gnb_name, slices in state.iab_associations_global.items()
+        for s in slices
+    }
+
     decisions = []
     for gnb_id, ues in topology.items():
         for ue_key, data in ues.items():
+            own_iab_gnb = iab_slice_owner.get((data["sst"], data["sd"]))
+
             best_gnb  = gnb_id
             best_rsrp = data["serving_rsrp"]
             for nb_gnb, nb_rsrp in data["neighbor_rsrp"].items():
+                if nb_gnb == own_iab_gnb:
+                    continue   # never hand IAB UE over to its own gNB side
                 if nb_rsrp > best_rsrp:
                     best_gnb  = nb_gnb
                     best_rsrp = nb_rsrp
