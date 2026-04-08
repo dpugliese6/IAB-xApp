@@ -141,6 +141,12 @@ def indication_callback(ind_hdr, ind_msg, meid, sub_id=None):
             }
             topo.upsert_record(gnb_idx, str(ue_id), sst, sd, record)
 
+            # Store UE ID info (scalar values only — raw C struct memory is not safe to hold)
+            state.ue_ids.setdefault(gnbid, {})[ue_key] = {
+                "id":   ue_id,
+                "type": meas_report_ue.ue_meas_report_lst.type.value,
+            }
+
         topo.cleanup_stale(gnb_idx)
 
     topo.write_csv()
@@ -188,6 +194,7 @@ if __name__ == '__main__':
 
     # Initialise shared state
     state.logger                 = xapp_gen.logger
+    state.xapp_gen_global        = xapp_gen
     state.gnb_list_global        = gnb_list
     state.gnb_neighbors_global   = gnb_neighbors
     state.gnb_count_global       = len(gnb_list) - 1

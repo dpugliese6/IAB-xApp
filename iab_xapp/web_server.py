@@ -6,6 +6,7 @@ from flask import Flask, jsonify, render_template_string
 
 import state
 import topology as topo
+import handover_controller as ho
 
 
 HTML = """<!DOCTYPE html>
@@ -37,6 +38,17 @@ HTML = """<!DOCTYPE html>
     background: rgba(0,0,0,0.6); border-radius: 8px; padding: 6px 12px;
     font-size: 12px; color: #a9e34b;
   }
+  #ho-btn {
+    position: absolute; bottom: 24px; right: 24px;
+    background: #7048e8; color: #fff; border: none; border-radius: 8px;
+    padding: 10px 20px; font-size: 14px; cursor: pointer;
+  }
+  #ho-btn:hover { background: #5f3dc4; }
+  #ho-result {
+    position: absolute; bottom: 72px; right: 24px; max-width: 420px;
+    background: rgba(0,0,0,0.75); border-radius: 8px; padding: 10px 14px;
+    font-size: 12px; color: #ddd; display: none; white-space: pre-wrap;
+  }
 </style>
 </head>
 <body>
@@ -52,6 +64,8 @@ HTML = """<!DOCTYPE html>
 </div>
 <div id="status">Waiting for data...</div>
 <div id="net"></div>
+<div id="ho-result"></div>
+<button id="ho-btn" onclick="triggerHandover()">Optimize &amp; Handover</button>
 <script>
 const IAB_COLOR  = { background: "#e599f7", border: "#9c36b5" };
 const GNB_COLOR  = { background: "#4dabf7", border: "#1971c2" };
@@ -125,6 +139,32 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 5000);
+
+async function triggerHandover() {
+  const btn = document.getElementById("ho-btn");
+  const box = document.getElementById("ho-result");
+  btn.disabled = true;
+  btn.textContent = "Running...";
+  box.style.display = "none";
+  try {
+    const res  = await fetch("/handover", { method: "POST" });
+    const data = await res.json();
+    if (data.decisions.length === 0) {
+      box.textContent = "No handovers needed (no neighbor exceeds serving by 5 dBm).";
+    } else {
+      box.textContent = data.decisions.map(d =>
+        `UE ${d.ue_id}: ${d.current_gnb.slice(-8)} (${d.current_rsrp.toFixed(1)} dBm) → ${d.target_gnb.slice(-8)} (${d.target_rsrp.toFixed(1)} dBm)`
+      ).join("\\n") + `\\n\\nSent: ${data.executed}/${data.decisions.length}`;
+    }
+    box.style.display = "block";
+  } catch (err) {
+    box.textContent = "Error: " + err.message;
+    box.style.display = "block";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Optimize & Handover";
+  }
+}
 </script>
 </body>
 </html>"""
@@ -151,5 +191,12 @@ def create_app():
             state.iab_associations_global,
             state.subscribed_gnbs_global,
         ))
+
+    @app.route("/handover", methods=["POST"])
+    def handover():
+        topology  = topo.topology_from_memory()
+        decisions = ho.compute_ho_decisions(topology)
+        executed  = ho.execute_handovers(decisions)
+        return jsonify({"decisions": decisions, "executed": executed})
 
     return app
