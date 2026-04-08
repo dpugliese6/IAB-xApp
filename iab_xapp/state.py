@@ -6,9 +6,8 @@ All modules must access these via  `import state; state.X`
 
 STALE_TIMEOUT_MS = 5000
 
-# SST and SD ranges for subscriptions
-SST_SET  = [1, 2]
-SD_RANGE = list(range(0, 11))  # 0 to 10
+n_iab_nodes = 1 #TODO: extract number from associations file
+IAB_NODES = list(range(1, n_iab_nodes+1)) 
 
 # topology_data[i] = list of measurement dicts for gnb_list[i]
 # each dict: {timestamp, sst, sd, ue_id, value_serv, value_neigh_0, ...}

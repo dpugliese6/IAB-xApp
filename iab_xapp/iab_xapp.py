@@ -247,22 +247,38 @@ if __name__ == '__main__':
         state.logger.debug("[Main] gNB {} - Selected functions: {}".format(gnb_name, func_def_dict[selected_format]))
 
         all_ok = True
-        for sst in state.SST_SET:
-            for sd in state.SD_RANGE:
-                status = kpm_xapp.subscribe(
-                    gnb=gnb,
-                    ev_trigger=ev_trigger_tuple,
-                    func_def=func_def_sub_dict,
-                    ran_period_ms=1000,
-                    sst=sst,
-                    sd=sd,
-                )
-                if status != 201:
-                    state.logger.error("[Main] gNB {} sst={} sd={} - subscription failed (status: {})".format(
-                        gnb_name, sst, sd, status))
-                    all_ok = False
-                else:
-                    state.logger.info("[Main] gNB {} sst={} sd={} - subscription OK".format(gnb_name, sst, sd))
+        # Subscription for normal users
+        status = kpm_xapp.subscribe(
+            gnb=gnb,
+            ev_trigger=ev_trigger_tuple,
+            func_def=func_def_sub_dict,
+            ran_period_ms=1000,
+            sst=1,
+            sd=0,
+        )
+        if status != 201:
+            state.logger.error("[Main] gNB {} sst={} sd={} - subscription failed (status: {})".format(
+                gnb_name, 1, 0, status))
+            all_ok = False
+        else:
+            state.logger.info("[Main] gNB {} sst={} sd={} - subscription OK".format(gnb_name, 1, 0))
+
+
+        for sd in state.IAB_NODES:
+            status = kpm_xapp.subscribe(
+                gnb=gnb,
+                ev_trigger=ev_trigger_tuple,
+                func_def=func_def_sub_dict,
+                ran_period_ms=1000,
+                sst=2,
+                sd=sd,
+            )
+            if status != 201:
+                state.logger.error("[Main] gNB {} sst={} sd={} - subscription failed (status: {})".format(
+                    gnb_name, 2, sd, status))
+                all_ok = False
+            else:
+                state.logger.info("[Main] gNB {} sst={} sd={} - subscription OK".format(gnb_name, 2, sd))
         return all_ok
 
     def subscription_loop():
